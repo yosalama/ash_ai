@@ -869,7 +869,8 @@ defmodule AshAi do
         &1.domain,
         &1.resource,
         &1.action,
-        opts.tenant
+        opts.tenant,
+        opts.context
       )
     )
   end
@@ -969,14 +970,20 @@ defmodule AshAi do
     end)
   end
 
-  defp can?(actor, domain, resource, action, tenant) do
+  defp pre_check_context(context) do
+    Map.update(context || %{}, :private, %{ash_ai_pre_check?: true}, fn private ->
+      Map.put(private, :ash_ai_pre_check?, true)
+    end)
+  end
+
+  defp can?(actor, domain, resource, action, tenant, context) do
     if Enum.empty?(Ash.Resource.Info.authorizers(resource)) do
       true
     else
       Ash.can?({resource, action}, actor,
         tenant: tenant,
         domain: domain,
-        context: %{private: %{ash_ai_pre_check?: true}},
+        context: pre_check_context(context),
         maybe_is: true,
         run_queries?: false,
         pre_flight?: false
