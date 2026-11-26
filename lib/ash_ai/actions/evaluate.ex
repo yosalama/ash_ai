@@ -28,6 +28,9 @@ if Code.ensure_loaded?(ReqLLM) do
       question's instructions.
     - `{:array, answer_type}` asks a runtime-sized list of questions, one per entry
       returned by the `questions` option, and returns the answers in the same order.
+    - `{:array, AshAi.Evaluate.Judgments}` asks a runtime-sized list of question
+      groups, each with the same fields, in a single request, and returns one map of
+      answers per group in the same order.
     - `AshAi.Actions.Result` wrapping any of the above also returns the model that
       answered, token usage, and provider metadata.
 
@@ -54,6 +57,8 @@ if Code.ensure_loaded?(ReqLLM) do
     - `Judgments` or map: a map of field name to question, overriding those fields'
       descriptions; unnamed fields keep their description
     - `{:array, answer_type}`: a list of questions, one per element
+    - `{:array, Judgments}`: a list with one entry per group, each a map of field name
+      to question like the `Judgments` case; unnamed fields keep their description
 
     A question is either instructions (a string, or a map or list for structured
     instructions), or a map with `:instructions` and `:criteria`. Criteria are the
@@ -136,11 +141,23 @@ if Code.ensure_loaded?(ReqLLM) do
       {:error, "evaluate actions must declare a return type"}
     end
 
-    defp plan(_action, {:array, item_type} = returns, constraints) do
-      if Answer.answer_type?(item_type) do
-        {:ok, {:list, Ash.Type.get_type(item_type), constraints[:items] || []}}
-      else
-        unsupported_return(returns)
+    defp plan(action, {:array, item_type} = returns, constraints) do
+      item_type = Ash.Type.get_type(item_type)
+      item_constraints = constraints[:items] || []
+
+      cond do
+        Answer.answer_type?(item_type) ->
+          {:ok, {:list, item_type, item_constraints}}
+
+        Ash.Type.NewType.subtype_of(item_type) == Ash.Type.Map ->
+          fields = Ash.Type.NewType.constraints(item_type, item_constraints)[:fields] || []
+
+          with {:ok, {:fields, fields}} <- plan_fields(action, fields) do
+            {:ok, {:groups, fields}}
+          end
+
+        true ->
+          unsupported_return(returns)
       end
     end
 
@@ -161,7 +178,7 @@ if Code.ensure_loaded?(ReqLLM) do
 
     defp unsupported_return(returns) do
       {:error,
-       "evaluate actions must return an answer type (`AshAi.Evaluate.Choice`, `AshAi.Evaluate.Noul`, `AshAi.Evaluate.Score`), an array of one, `AshAi.Evaluate.Judgments`, or `AshAi.Actions.Result` wrapping one of those, got: #{inspect(returns)}"}
+       "evaluate actions must return an answer type (`AshAi.Evaluate.Choice`, `AshAi.Evaluate.Noul`, `AshAi.Evaluate.Score`), an array of one, `AshAi.Evaluate.Judgments`, an array of `AshAi.Evaluate.Judgments`, or `AshAi.Actions.Result` wrapping one of those, got: #{inspect(returns)}"}
     end
 
     defp plan_fields(_action, []) do
@@ -202,34 +219,41 @@ if Code.ensure_loaded?(ReqLLM) do
           end
 
         {{:fields, fields}, given} when is_nil(given) or is_map(given) or is_list(given) ->
-          overrides = Map.new(given || [])
-          field_names = Enum.map(fields, &elem(&1, 0))
-
-          case Map.keys(overrides) -- field_names do
-            [] ->
-              Enum.reduce_while(fields, {:ok, []}, fn {name, type, constraints, description},
-                                                      {:ok, acc} ->
-                case question_spec(Map.get(overrides, name), description, "field `#{name}`") do
-                  {:ok, {instructions, criteria}} ->
-                    {:cont, {:ok, [{name, type, constraints, instructions, criteria} | acc]}}
-
-                  {:error, error} ->
-                    {:halt, {:error, error}}
-                end
-              end)
-              |> case do
-                {:ok, specs} -> {:ok, Enum.reverse(specs)}
-                {:error, error} -> {:error, error}
-              end
-
-            unknown ->
-              {:error,
-               "`questions` names fields that are not in the return type: #{inspect(unknown)}"}
-          end
+          field_specs(fields, given, & &1, "")
 
         {{:fields, _}, given} ->
           {:error,
            "`questions` for a map return type must be a map of field name to question, got: #{inspect(given)}"}
+
+        {{:groups, _fields}, nil} ->
+          {:error,
+           "an array of judgments requires the `questions` option to supply one entry per element"}
+
+        {{:groups, fields}, given} when is_list(given) ->
+          given
+          |> Enum.with_index()
+          |> Enum.reduce_while({:ok, []}, fn {group, index}, {:ok, acc} ->
+            with true <- is_nil(group) or is_map(group) or Keyword.keyword?(group),
+                 {:ok, specs} <-
+                   field_specs(fields, group, &{index, &1}, " of question #{index}") do
+              {:cont, {:ok, [specs | acc]}}
+            else
+              false ->
+                {:halt,
+                 {:error,
+                  "question #{index} for an array of judgments must be a map of field name to question, got: #{inspect(group)}"}}
+
+              {:error, error} ->
+                {:halt, {:error, error}}
+            end
+          end)
+          |> case do
+            {:ok, groups} -> {:ok, groups |> Enum.reverse() |> Enum.concat()}
+            {:error, error} -> {:error, error}
+          end
+
+        {{:groups, _}, given} ->
+          {:error, "`questions` for an array of judgments must be a list, got: #{inspect(given)}"}
 
         {{:list, _type, _constraints}, nil} ->
           {:error,
@@ -254,6 +278,39 @@ if Code.ensure_loaded?(ReqLLM) do
 
         {{:list, _, _}, given} ->
           {:error, "`questions` for an array return type must be a list, got: #{inspect(given)}"}
+      end
+    end
+
+    # One spec per field: `overrides` may replace a field's description; `id` builds
+    # each spec's id from the field name.
+    defp field_specs(fields, overrides, id, location) do
+      overrides = Map.new(overrides || [])
+      field_names = Enum.map(fields, &elem(&1, 0))
+
+      case Map.keys(overrides) -- field_names do
+        [] ->
+          Enum.reduce_while(fields, {:ok, []}, fn {name, type, constraints, description},
+                                                  {:ok, acc} ->
+            case question_spec(
+                   Map.get(overrides, name),
+                   description,
+                   "field `#{name}`#{location}"
+                 ) do
+              {:ok, {instructions, criteria}} ->
+                {:cont, {:ok, [{id.(name), type, constraints, instructions, criteria} | acc]}}
+
+              {:error, error} ->
+                {:halt, {:error, error}}
+            end
+          end)
+          |> case do
+            {:ok, specs} -> {:ok, Enum.reverse(specs)}
+            {:error, error} -> {:error, error}
+          end
+
+        unknown ->
+          {:error,
+           "`questions`#{location} names fields that are not in the return type: #{inspect(unknown)}"}
       end
     end
 
@@ -305,6 +362,7 @@ if Code.ensure_loaded?(ReqLLM) do
     end
 
     defp question_id(id) when is_integer(id), do: "q#{id}"
+    defp question_id({index, field}), do: "q#{index}_#{field}"
     defp question_id(id), do: to_string(id)
 
     # TypeSafe rejects an empty question map; an empty list of questions has an
@@ -329,12 +387,28 @@ if Code.ensure_loaded?(ReqLLM) do
     defp collect({:single, _, _, _, _}, [spec], answers), do: fetch_answer(spec, answers)
 
     defp collect({:fields, _}, specs, answers) do
-      Enum.reduce_while(specs, {:ok, %{}}, fn {name, _, _, _, _} = spec, {:ok, acc} ->
+      Enum.reduce_while(specs, {:ok, %{}}, fn {id, _, _, _, _} = spec, {:ok, acc} ->
         case fetch_answer(spec, answers) do
-          {:ok, answer} -> {:cont, {:ok, Map.put(acc, name, answer)}}
+          {:ok, answer} -> {:cont, {:ok, Map.put(acc, field_name(id), answer)}}
           {:error, error} -> {:halt, {:error, error}}
         end
       end)
+    end
+
+    # Specs come grouped in question order, one per field of each group.
+    defp collect({:groups, fields}, specs, answers) do
+      specs
+      |> Enum.chunk_every(length(fields))
+      |> Enum.reduce_while({:ok, []}, fn group, {:ok, acc} ->
+        case collect({:fields, fields}, group, answers) do
+          {:ok, group_answers} -> {:cont, {:ok, [group_answers | acc]}}
+          {:error, error} -> {:halt, {:error, error}}
+        end
+      end)
+      |> case do
+        {:ok, groups} -> {:ok, Enum.reverse(groups)}
+        {:error, error} -> {:error, error}
+      end
     end
 
     defp collect({:list, _, _}, specs, answers) do
@@ -349,6 +423,9 @@ if Code.ensure_loaded?(ReqLLM) do
         {:error, error} -> {:error, error}
       end
     end
+
+    defp field_name({_index, name}), do: name
+    defp field_name(name), do: name
 
     defp fetch_answer({id, type, constraints, _, _}, answers) do
       key = question_id(id)

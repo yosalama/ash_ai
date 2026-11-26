@@ -80,6 +80,40 @@ defmodule AshAi.Actions.EvaluateTest do
     end
   end
 
+  defmodule FakeReqLLMPerQuestion do
+    @moduledoc "Answers yes/no questions with a probability that depends on the question id"
+
+    @probabilities %{
+      "q0_any_fits" => 0.11,
+      "q0_day_first" => 0.22,
+      "q1_any_fits" => 0.88,
+      "q1_day_first" => 0.77
+    }
+
+    def evaluate(model, state, questions, opts) do
+      {:ok, %{object: answers}} = FakeReqLLM.evaluate(model, state, questions, opts)
+
+      {:ok,
+       %{
+         object:
+           Map.new(answers, fn
+             {id, %{"type" => "boolean"} = answer} ->
+               {id, %{answer | "probability" => Map.fetch!(@probabilities, id)}}
+
+             other ->
+               other
+           end)
+       }}
+    end
+  end
+
+  defmodule FakeReqLLMDropsOne do
+    def evaluate(model, state, questions, opts) do
+      {:ok, %{object: answers}} = FakeReqLLM.evaluate(model, state, questions, opts)
+      {:ok, %{object: Map.delete(answers, "q1_day_first")}}
+    end
+  end
+
   defmodule FakeReqLLMMissingAnswer do
     def evaluate(_model, _state, _questions, _opts), do: {:ok, %{object: %{}}}
   end
@@ -240,6 +274,82 @@ defmodule AshAi.Actions.EvaluateTest do
         constraints(items: [of: Taxonomy])
 
         run evaluate("typesafe:jev-latest", req_llm: FakeReqLLM)
+      end
+
+      action :map_columns, {:array, AshAi.Evaluate.Judgments} do
+        argument(:columns, {:array, :map}, allow_nil?: false)
+
+        constraints items: [
+                      fields: [
+                        field: [type: AshAi.Evaluate.Choice, description: "Which field?"],
+                        any_fits: [type: :boolean, description: "Does any field fit?"],
+                        day_first: [type: :boolean, description: "Are dates day-first?"]
+                      ]
+                    ]
+
+        run evaluate("typesafe:jev-latest",
+              req_llm: FakeReqLLMPerQuestion,
+              questions: fn input, _ctx ->
+                input.arguments.columns
+                |> Enum.with_index()
+                |> Enum.map(fn {column, i} ->
+                  %{
+                    field: %{
+                      instructions: "Which field does `columns[#{i}]` hold?",
+                      criteria: column["candidates"]
+                    },
+                    any_fits: "Does any candidate fit `columns[#{i}]`?"
+                  }
+                end)
+              end
+            )
+      end
+
+      action :map_columns_result, AshAi.Actions.Result do
+        argument(:count, :integer, allow_nil?: false)
+
+        constraints of: {:array, AshAi.Evaluate.Judgments},
+                    constraints: [
+                      items: [fields: [urgent: [type: :boolean, description: "Urgent?"]]]
+                    ]
+
+        run evaluate("typesafe:jev-latest",
+              req_llm: FakeReqLLM,
+              questions: fn input, _ctx -> List.duplicate(nil, input.arguments.count) end
+            )
+      end
+
+      action :map_columns_drops_one, {:array, AshAi.Evaluate.Judgments} do
+        argument(:count, :integer, allow_nil?: false)
+
+        constraints items: [
+                      fields: [
+                        any_fits: [type: :boolean, description: "Fits?"],
+                        day_first: [type: :boolean, description: "Day-first?"]
+                      ]
+                    ]
+
+        run evaluate("typesafe:jev-latest",
+              req_llm: FakeReqLLMDropsOne,
+              questions: fn input, _ctx -> List.duplicate(%{}, input.arguments.count) end
+            )
+      end
+
+      action :map_columns_bad, {:array, AshAi.Evaluate.Judgments} do
+        argument(:case, :atom, allow_nil?: false)
+
+        constraints items: [fields: [any_fits: [type: :boolean, description: "Fits?"]]]
+
+        run evaluate("typesafe:jev-latest",
+              req_llm: FakeReqLLM,
+              questions: fn input, _ctx ->
+                case input.arguments.case do
+                  :missing -> nil
+                  :unknown_field -> [%{}, %{nope: "?"}]
+                  :not_a_map -> [%{}, "just a string"]
+                end
+              end
+            )
       end
 
       action :missing_answer, AshAi.Evaluate.Noul do
@@ -453,6 +563,103 @@ defmodule AshAi.Actions.EvaluateTest do
                |> Ash.run_action()
 
       assert Exception.message(error) =~ "requires the `questions` option"
+    end
+  end
+
+  describe "array of judgments return type" do
+    test "asks every group's questions in one request and returns one answer map per group, in order" do
+      result =
+        TestResource
+        |> Ash.ActionInput.for_action(:map_columns, %{
+          columns: [
+            %{"candidates" => %{"first_name" => "Given name", "birth_date" => "Date of birth"}},
+            %{"candidates" => %{"work_email" => "Work email", "last_name" => "Family name"}}
+          ]
+        })
+        |> Ash.run_action!()
+
+      assert_receive {:evaluate_called, "typesafe:jev-latest", _state, questions, _opts}
+      refute_receive {:evaluate_called, _, _, _, _}
+
+      assert questions |> Map.keys() |> Enum.sort() ==
+               ~w(q0_any_fits q0_day_first q0_field q1_any_fits q1_day_first q1_field)
+
+      assert questions["q1_field"] == %{
+               type: :choice,
+               instructions: "Which field does `columns[1]` hold?",
+               criteria: %{"work_email" => "Work email", "last_name" => "Family name"}
+             }
+
+      assert questions["q0_any_fits"] == %{
+               type: :boolean,
+               instructions: "Does any candidate fit `columns[0]`?"
+             }
+
+      assert questions["q1_day_first"] == %{
+               type: :boolean,
+               instructions: "Are dates day-first?"
+             }
+
+      assert [first, second] = result
+      assert %Choice{value: "birth_date"} = first.field
+      assert %Noul{probability: 0.11} = first.any_fits
+      assert %Noul{probability: 0.22} = first.day_first
+      assert %Choice{value: "last_name"} = second.field
+      assert %Noul{probability: 0.88} = second.any_fits
+      assert %Noul{probability: 0.77} = second.day_first
+    end
+
+    test "nil entries keep every description, and the result can be wrapped" do
+      result =
+        TestResource
+        |> Ash.ActionInput.for_action(:map_columns_result, %{count: 2})
+        |> Ash.run_action!()
+
+      assert_receive {:evaluate_called, _, _, questions, _}
+
+      assert questions == %{
+               "q0_urgent" => %{type: :boolean, instructions: "Urgent?"},
+               "q1_urgent" => %{type: :boolean, instructions: "Urgent?"}
+             }
+
+      assert [%{urgent: %Noul{probability: 0.92}}, %{urgent: %Noul{probability: 0.92}}] =
+               result.result
+    end
+
+    test "an empty list never calls the model" do
+      assert [] =
+               TestResource
+               |> Ash.ActionInput.for_action(:map_columns, %{columns: []})
+               |> Ash.run_action!()
+
+      refute_receive {:evaluate_called, _, _, _, _}
+    end
+
+    test "a missing answer names its group and field" do
+      assert {:error, error} =
+               TestResource
+               |> Ash.ActionInput.for_action(:map_columns_drops_one, %{count: 2})
+               |> Ash.run_action()
+
+      assert Exception.message(error) =~ "no answer returned for question `q1_day_first`"
+    end
+
+    test "missing questions, unknown fields and non-map entries are errors" do
+      for {kind, message} <- [
+            missing: "requires the `questions` option to supply one entry per element",
+            unknown_field:
+              "`questions` of question 1 names fields that are not in the return type: [:nope]",
+            not_a_map: "question 1 for an array of judgments must be a map"
+          ] do
+        assert {:error, error} =
+                 TestResource
+                 |> Ash.ActionInput.for_action(:map_columns_bad, %{case: kind})
+                 |> Ash.run_action()
+
+        assert Exception.message(error) =~ message
+      end
+
+      refute_receive {:evaluate_called, _, _, _, _}
     end
   end
 
